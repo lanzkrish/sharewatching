@@ -148,10 +148,22 @@ export default function UploadVideoModal({ isOpen, onClose, onVideoUploaded }: U
           }
         } catch (s3Err: any) {
           console.warn(
-            "[Upload] S3 upload failed (likely S3 bucket CORS permissions not yet configured on AWS). Falling back to direct streaming storage...",
+            "[Upload] S3 upload failed (likely S3 bucket CORS permissions not yet configured on AWS).",
             s3Err
           );
           setUploadProgress(0);
+
+          // Netlify Serverless Functions enforce a strict 6MB payload limit (returning 413 Content Too Large)
+          const isServerless =
+            typeof window !== "undefined" &&
+            window.location.hostname !== "localhost" &&
+            window.location.hostname !== "127.0.0.1";
+
+          if (isServerless && file.size > 5 * 1024 * 1024) {
+            throw new Error(
+              "S3 upload failed (403 Forbidden). Netlify blocks video uploads over 6MB to the web server. Please add the CORS rule to your S3 bucket 'sharewatching-videos' in AWS Console to enable direct cloud uploads."
+            );
+          }
         }
       }
 
@@ -213,6 +225,14 @@ export default function UploadVideoModal({ isOpen, onClose, onVideoUploaded }: U
                 reject(new Error(parseErr.message || "Failed to parse upload response"));
               }
             } else {
+              if (xhr.status === 413) {
+                reject(
+                  new Error(
+                    "Video file exceeds Netlify's 6MB serverless limit. Please enable CORS on your AWS S3 bucket 'sharewatching-videos' to upload videos directly to S3 without size limits."
+                  )
+                );
+                return;
+              }
               try {
                 const errData = JSON.parse(xhr.responseText);
                 reject(new Error(errData.error || `Local upload failed with status ${xhr.status}`));
