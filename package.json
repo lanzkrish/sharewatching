@@ -6,7 +6,12 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "server:start": "npm --prefix server start",
+    "server:dev": "npm --prefix server run dev",
+    "server:pm2": "npm --prefix server run pm2:start",
+    "server:pm2:stop": "npm --prefix server run pm2:stop",
+    "server:pm2:logs": "npm --prefix server run pm2:logs"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1146.0",
