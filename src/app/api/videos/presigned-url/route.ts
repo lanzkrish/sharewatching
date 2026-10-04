@@ -41,7 +41,7 @@ export async function POST(req: NextRequest) {
 
       return NextResponse.json({
         isS3Configured: false,
-        message: "AWS S3 is not configured. Use local upload endpoint.",
+        message: "AWS S3 is not configured. Please verify AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and AWS_S3_BUCKET_NAME.",
       });
     }
 

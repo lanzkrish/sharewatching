@@ -20,7 +20,6 @@ export default function UploadVideoModal({ isOpen, onClose, onVideoUploaded }: U
   const [uploadProgress, setUploadProgress] = useState<number>(0);
   const [isUploading, setIsUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [storageType, setStorageType] = useState<"s3" | "local">("s3");
   const videoRef = useRef<HTMLVideoElement | null>(null);
 
   if (!isOpen) return null;
@@ -79,7 +78,7 @@ export default function UploadVideoModal({ isOpen, onClose, onVideoUploaded }: U
     setError(null);
 
     try {
-      // 1. Try S3 presigned URL first
+      // 1. Get S3 presigned PUT URL
       const presignedRes = await fetchWithAuth("/api/videos/presigned-url", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -91,164 +90,84 @@ export default function UploadVideoModal({ isOpen, onClose, onVideoUploaded }: U
 
       const presignedData = await presignedRes.json();
 
-      let uploadedSuccessfully = false;
-
-      if (presignedData.isS3Configured && presignedData.uploadUrl) {
-        // Upload directly to Amazon S3 via XMLHttpRequest to track progress
-        setStorageType("s3");
-        try {
-          await new Promise<void>((resolve, reject) => {
-            const xhr = new XMLHttpRequest();
-            xhr.open("PUT", presignedData.uploadUrl, true);
-            xhr.setRequestHeader("Content-Type", file.type || "video/mp4");
-
-            xhr.upload.onprogress = (e) => {
-              if (e.lengthComputable) {
-                const percent = Math.round((e.loaded / e.total) * 95);
-                setUploadProgress(percent);
-              }
-            };
-
-            xhr.onload = () => {
-              if (xhr.status >= 200 && xhr.status < 300) {
-                setUploadProgress(100);
-                resolve();
-              } else {
-                reject(new Error(`S3 upload failed with status ${xhr.status}`));
-              }
-            };
-
-            xhr.onerror = () => reject(new Error("Network error during S3 upload"));
-            xhr.send(file);
-          });
-
-          // Save video record in database
-          const recordRes = await fetchWithAuth("/api/videos", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              title,
-              description,
-              s3Key: presignedData.s3Key,
-              url: presignedData.fileUrl,
-              isLocal: false,
-              fileSize: file.size,
-              duration: Math.round(duration),
-              mimeType: file.type || "video/mp4",
-            }),
-          });
-
-          const recordData = await recordRes.json();
-          if (recordRes.ok && recordData.video) {
-            uploadedSuccessfully = true;
-            onVideoUploaded(recordData.video);
-            handleClose();
-          } else {
-            throw new Error(recordData.error || "Failed to record video details");
-          }
-        } catch (s3Err: any) {
-          console.warn(
-            "[Upload] S3 upload failed (likely S3 bucket CORS permissions not yet configured on AWS).",
-            s3Err
-          );
-          setUploadProgress(0);
-
-          // Netlify Serverless Functions enforce a strict 6MB payload limit (returning 413 Content Too Large)
-          const isServerless =
-            typeof window !== "undefined" &&
-            window.location.hostname !== "localhost" &&
-            window.location.hostname !== "127.0.0.1";
-
-          if (isServerless && file.size > 5 * 1024 * 1024) {
-            throw new Error(
-              "S3 upload failed (403 Forbidden). Netlify blocks video uploads over 6MB to the web server. Please add the CORS rule to your S3 bucket 'sharewatching-videos' in AWS Console to enable direct cloud uploads."
-            );
-          }
-        }
+      if (!presignedData.isS3Configured || !presignedData.uploadUrl) {
+        throw new Error(
+          presignedData.message ||
+            "Amazon S3 is not configured. Please check your AWS credentials and bucket name."
+        );
       }
 
-      // If S3 was not configured or S3 upload failed (e.g. CORS 403), use zero-RAM streaming local storage
-      if (!uploadedSuccessfully) {
-        setStorageType("local");
-
+      // 2. Upload directly to Amazon S3 via XMLHttpRequest with real-time progress
+      await new Promise<void>((resolve, reject) => {
         const xhr = new XMLHttpRequest();
-        await new Promise<void>((resolve, reject) => {
-          xhr.open("POST", "/api/videos/upload-local", true);
-          const token = typeof window !== "undefined" ? localStorage.getItem("sw_token") : null;
-          if (token) {
-            xhr.setRequestHeader("Authorization", `Bearer ${token}`);
+        xhr.open("PUT", presignedData.uploadUrl, true);
+        if (file.type) {
+          xhr.setRequestHeader("Content-Type", file.type);
+        }
+
+        xhr.upload.onprogress = (e) => {
+          if (e.lengthComputable) {
+            const percent = Math.round((e.loaded / e.total) * 95);
+            setUploadProgress(percent);
           }
-          xhr.setRequestHeader("Content-Type", file.type || "video/mp4");
-          xhr.setRequestHeader("x-file-name", encodeURIComponent(file.name));
-          xhr.setRequestHeader("x-file-title", encodeURIComponent(title));
-          xhr.setRequestHeader("x-file-description", encodeURIComponent(description));
-          xhr.setRequestHeader("x-file-size", file.size.toString());
+        };
 
-          xhr.upload.onprogress = (e) => {
-            if (e.lengthComputable) {
-              const percent = Math.round((e.loaded / e.total) * 90);
-              setUploadProgress(percent);
-            }
-          };
-
-          xhr.onload = async () => {
-            if (xhr.status >= 200 && xhr.status < 300) {
-              setUploadProgress(95);
-              try {
-                const localData = JSON.parse(xhr.responseText);
-
-                // Save to database
-                const recordRes = await fetchWithAuth("/api/videos", {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({
-                    title,
-                    description,
-                    url: localData.fileUrl,
-                    isLocal: true,
-                    fileSize: file.size,
-                    duration: Math.round(duration),
-                    mimeType: file.type || "video/mp4",
-                  }),
-                });
-
-                const recordData = await recordRes.json();
-                if (recordRes.ok && recordData.video) {
-                  setUploadProgress(100);
-                  onVideoUploaded(recordData.video);
-                  resolve();
-                  handleClose();
-                } else {
-                  reject(new Error(recordData.error || "Failed to save video metadata"));
-                }
-              } catch (parseErr: any) {
-                reject(new Error(parseErr.message || "Failed to parse upload response"));
+        xhr.onload = () => {
+          if (xhr.status >= 200 && xhr.status < 300) {
+            setUploadProgress(100);
+            resolve();
+          } else {
+            let s3Msg = `AWS S3 upload failed with status ${xhr.status} (${xhr.statusText})`;
+            try {
+              const parser = new DOMParser();
+              const xml = parser.parseFromString(xhr.responseText, "text/xml");
+              const code = xml.getElementsByTagName("Code")[0]?.textContent;
+              const msg = xml.getElementsByTagName("Message")[0]?.textContent;
+              if (code && msg) {
+                s3Msg = `AWS S3 Error [${code}]: ${msg}`;
               }
-            } else {
-              if (xhr.status === 413) {
-                reject(
-                  new Error(
-                    "Video file exceeds Netlify's 6MB serverless limit. Please enable CORS on your AWS S3 bucket 'sharewatching-videos' to upload videos directly to S3 without size limits."
-                  )
-                );
-                return;
-              }
-              try {
-                const errData = JSON.parse(xhr.responseText);
-                reject(new Error(errData.error || `Local upload failed with status ${xhr.status}`));
-              } catch {
-                reject(new Error(`Local upload failed with status ${xhr.status}`));
-              }
-            }
-          };
+            } catch {}
+            reject(new Error(s3Msg));
+          }
+        };
 
-          xhr.onerror = () => reject(new Error("Network error during local upload"));
-          xhr.send(file);
-        });
+        xhr.onerror = () => {
+          reject(
+            new Error(
+              "Network error uploading to S3. Please verify your S3 bucket CORS permissions."
+            )
+          );
+        };
+
+        xhr.send(file);
+      });
+
+      // 3. Save video record in MongoDB database
+      const recordRes = await fetchWithAuth("/api/videos", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title,
+          description,
+          s3Key: presignedData.s3Key,
+          url: presignedData.fileUrl,
+          isLocal: false,
+          fileSize: file.size,
+          duration: Math.round(duration),
+          mimeType: file.type || "video/mp4",
+        }),
+      });
+
+      const recordData = await recordRes.json();
+      if (recordRes.ok && recordData.video) {
+        onVideoUploaded(recordData.video);
+        handleClose();
+      } else {
+        throw new Error(recordData.error || "Failed to record video details in database");
       }
     } catch (err: any) {
-      console.error("Upload error:", err);
-      setError(err.message || "An error occurred while uploading video");
+      console.error("Direct S3 upload error:", err);
+      setError(err.message || "An error occurred while uploading video to Amazon S3");
     } finally {
       setIsUploading(false);
     }
@@ -332,12 +251,6 @@ export default function UploadVideoModal({ isOpen, onClose, onVideoUploaded }: U
                     </button>
                   )}
                 </div>
-
-                {file.size > 500 * 1024 * 1024 && (
-                  <p className="text-[11px] text-amber-300/90 bg-amber-500/10 border border-amber-500/20 rounded-lg px-2.5 py-1.5">
-                    💡 Large file ({(file.size / (1024 * 1024 * 1024)).toFixed(1)} GB): Upload will stream directly to disk without consuming RAM. For production or full movies, configuring AWS S3 or Cloudflare R2 is recommended.
-                  </p>
-                )}
               </div>
             )}
           </div>
@@ -389,9 +302,7 @@ export default function UploadVideoModal({ isOpen, onClose, onVideoUploaded }: U
               <div className="flex items-center justify-between text-xs">
                 <span className="text-slate-300 flex items-center space-x-1.5">
                   <Loader2 className="w-3.5 h-3.5 animate-spin text-brand-400" />
-                  <span>
-                    Uploading to {storageType === "s3" ? "Amazon S3 folder" : "Cloud Storage"}...
-                  </span>
+                  <span>Uploading directly to Amazon S3...</span>
                 </span>
                 <span className="font-mono text-brand-300 font-bold">{uploadProgress}%</span>
               </div>

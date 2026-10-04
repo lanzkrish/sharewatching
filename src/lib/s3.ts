@@ -1,13 +1,14 @@
 import { S3Client, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 
-const region = process.env.S3_REGION || process.env.AWS_REGION || "us-east-1";
+const region = process.env.S3_REGION || process.env.AWS_REGION || "ap-south-2";
 const accessKeyId = process.env.S3_ACCESS_KEY_ID || process.env.AWS_ACCESS_KEY_ID;
 const secretAccessKey = process.env.S3_SECRET_ACCESS_KEY || process.env.AWS_SECRET_ACCESS_KEY;
+const sessionToken = process.env.S3_SESSION_TOKEN || process.env.AWS_SESSION_TOKEN;
 const bucketName =
   process.env.S3_BUCKET_NAME ||
   process.env.AWS_S3_BUCKET_NAME ||
-  "sharewatching-videos";
+  "sharewatching-videos-ap-south-2";
 
 export function isS3Configured(): boolean {
   return Boolean(accessKeyId && secretAccessKey && bucketName);
@@ -23,6 +24,7 @@ export function getS3Client(): S3Client | null {
       credentials: {
         accessKeyId: accessKeyId!,
         secretAccessKey: secretAccessKey!,
+        ...(sessionToken ? { sessionToken } : {}),
       },
       // Prevent AWS SDK v3 from adding automatic CRC32 checksum query params to presigned URLs
       requestChecksumCalculation: "WHEN_REQUIRED",
@@ -60,11 +62,13 @@ export async function generatePresignedUploadUrl(
   const command = new PutObjectCommand({
     Bucket: bucketName,
     Key: s3Key,
-    ContentType: contentType,
   });
 
   // URL valid for 30 minutes
-  const uploadUrl = await getSignedUrl(client, command, { expiresIn: 1800 });
+  const uploadUrl = await getSignedUrl(client, command, {
+    expiresIn: 1800,
+    unhoistableHeaders: new Set(["x-amz-sdk-checksum-algorithm", "x-amz-checksum-crc32"]),
+  });
   const fileUrl = `https://${bucketName}.s3.${region}.amazonaws.com/${s3Key}`;
 
   return {

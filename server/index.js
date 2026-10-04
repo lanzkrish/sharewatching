@@ -66,10 +66,11 @@ app.get("/api/ice-servers", (req, res) => {
 
 // S3 Configuration & Presigned URL generator on backend server
 let s3ClientInstance = null;
-const s3Region = process.env.S3_REGION || process.env.AWS_REGION || "us-east-1";
+const s3Region = process.env.S3_REGION || process.env.AWS_REGION || "ap-south-2";
 const s3AccessKeyId = process.env.S3_ACCESS_KEY_ID || process.env.AWS_ACCESS_KEY_ID;
 const s3SecretAccessKey = process.env.S3_SECRET_ACCESS_KEY || process.env.AWS_SECRET_ACCESS_KEY;
-const s3BucketName = process.env.S3_BUCKET_NAME || process.env.AWS_S3_BUCKET_NAME;
+const s3BucketName =
+  process.env.S3_BUCKET_NAME || process.env.AWS_S3_BUCKET_NAME || "sharewatching-videos-ap-south-2";
 
 function isServerS3Configured() {
   return Boolean(s3AccessKeyId && s3SecretAccessKey && s3BucketName);
