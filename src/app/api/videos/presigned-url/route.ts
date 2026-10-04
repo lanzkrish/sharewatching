@@ -14,53 +14,54 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: "fileName is required" }, { status: 400 });
     }
 
-    if (!isS3Configured()) {
-      // Check if S3 credentials are hosted on the standalone backend server (Droplet)
-      const socketUrl = process.env.NEXT_PUBLIC_SOCKET_URL;
-      if (socketUrl && !socketUrl.includes("localhost")) {
-        try {
-          const remoteRes = await fetch(`${socketUrl}/api/videos/presigned-url`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              userId: user.id,
-              fileName,
-              contentType: contentType || "video/mp4",
-            }),
-          });
-          if (remoteRes.ok) {
-            const remoteData = await remoteRes.json();
-            if (remoteData.isS3Configured) {
-              return NextResponse.json(remoteData);
-            }
-          }
-        } catch (serverErr) {
-          console.warn("Backend server S3 presign failed:", serverErr);
-        }
-      }
+    // 1. Primary: DigitalOcean Droplet backend server handshake
+    // Keeps all AWS credentials securely isolated on the backend server
+    const backendServerUrl =
+      process.env.BACKEND_SERVER_URL ||
+      process.env.NEXT_PUBLIC_SOCKET_URL ||
+      "http://64.227.172.18:5008";
 
-      return NextResponse.json({
-        isS3Configured: false,
-        message: "AWS S3 is not configured. Please verify AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and AWS_S3_BUCKET_NAME.",
-      });
+    if (backendServerUrl) {
+      try {
+        const remoteRes = await fetch(`${backendServerUrl}/api/videos/presigned-url`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            userId: user.id,
+            fileName,
+            contentType: contentType || "video/mp4",
+          }),
+        });
+        if (remoteRes.ok) {
+          const remoteData = await remoteRes.json();
+          if (remoteData.isS3Configured && remoteData.uploadUrl) {
+            return NextResponse.json(remoteData);
+          }
+        }
+      } catch (serverErr) {
+        console.warn("[Presigned URL] Handshake with backend server failed, checking local config:", serverErr);
+      }
     }
 
-    const result = await generatePresignedUploadUrl(
-      user.id,
-      fileName,
-      contentType || "video/mp4"
-    );
+    // 2. Secondary: If backend server is unreachable and environment has S3 credentials
+    if (isS3Configured()) {
+      const result = await generatePresignedUploadUrl(
+        user.id,
+        fileName,
+        contentType || "video/mp4"
+      );
 
-    if (!result) {
-      return NextResponse.json({
-        isS3Configured: false,
-        message: "Failed to generate presigned URL",
-      });
+      if (result) {
+        return NextResponse.json({
+          isS3Configured: true,
+          ...result,
+        });
+      }
     }
 
     return NextResponse.json({
-      isS3Configured: true,
-      ...result,
+      isS3Configured: false,
+      message: "AWS S3 is not configured on the server. Please verify credentials in server/.env.",
     });
   } catch (error: any) {
     console.error("Presigned URL error:", error);

@@ -78,8 +78,8 @@ export default function UploadVideoModal({ isOpen, onClose, onVideoUploaded }: U
     setError(null);
 
     try {
-      // 1. Get S3 presigned PUT URL
-      const presignedRes = await fetchWithAuth("/api/videos/presigned-url", {
+      // 1. Get S3 presigned PUT URL (delegates to backend server with secure AWS credentials)
+      let presignedRes = await fetchWithAuth("/api/videos/presigned-url", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -88,12 +88,30 @@ export default function UploadVideoModal({ isOpen, onClose, onVideoUploaded }: U
         }),
       });
 
-      const presignedData = await presignedRes.json();
+      let presignedData = await presignedRes.json().catch(() => null);
 
-      if (!presignedData.isS3Configured || !presignedData.uploadUrl) {
+      // Direct fallback to backend server proxy if Next.js route failed
+      if (!presignedData || !presignedData.uploadUrl) {
+        try {
+          const directServerRes = await fetch("/api/server/api/videos/presigned-url", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              userId: "user",
+              fileName: file.name,
+              contentType: file.type || "video/mp4",
+            }),
+          });
+          if (directServerRes.ok) {
+            presignedData = await directServerRes.json();
+          }
+        } catch {}
+      }
+
+      if (!presignedData || !presignedData.uploadUrl) {
         throw new Error(
-          presignedData.message ||
-            "Amazon S3 is not configured. Please check your AWS credentials and bucket name."
+          presignedData?.message ||
+            "Unable to generate S3 upload URL. Please verify the backend server is running."
         );
       }
 

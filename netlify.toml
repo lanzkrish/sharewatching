@@ -15,3 +15,10 @@
   to = "http://64.227.172.18:5008/socket.io/:splat"
   status = 200
   force = true
+
+# Reverse proxy API calls to backend server
+[[redirects]]
+  from = "/api/server/*"
+  to = "http://64.227.172.18:5008/:splat"
+  status = 200
+  force = true

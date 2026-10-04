@@ -119,10 +119,12 @@ app.post("/api/videos/presigned-url", async (req, res) => {
     const command = new PutObjectCommand({
       Bucket: s3BucketName,
       Key: s3Key,
-      ContentType: contentType,
     });
 
-    const uploadUrl = await getSignedUrl(client, command, { expiresIn: 1800 });
+    const uploadUrl = await getSignedUrl(client, command, {
+      expiresIn: 1800,
+      unhoistableHeaders: new Set(["x-amz-sdk-checksum-algorithm", "x-amz-checksum-crc32"]),
+    });
     const fileUrl = `https://${s3BucketName}.s3.${s3Region}.amazonaws.com/${s3Key}`;
 
     return res.json({
