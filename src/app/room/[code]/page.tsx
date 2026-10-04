@@ -1,0 +1,610 @@
+"use client";
+
+import React, { useState, useEffect, useRef, use } from "react";
+import { useRouter } from "next/navigation";
+import { useAuth } from "@/context/AuthContext";
+import Navbar from "@/components/Navbar";
+import VideoPlayer from "@/components/VideoPlayer";
+import MeetConferenceBar from "@/components/MeetConferenceBar";
+import ChatSidebar, { ChatMessage } from "@/components/ChatSidebar";
+import WatchTogetherModal from "@/components/WatchTogetherModal";
+import { WebRTCManager } from "@/lib/webrtc";
+import {
+  getSocket,
+  joinSocketRoom,
+  sendSocketSignal,
+  sendSocketVideoAction,
+  sendSocketSelectVideo,
+  sendSocketChatMessage,
+  disconnectSocket,
+} from "@/lib/socket";
+import { IRoom, IVideo, PlaybackAction, ISignalMessage } from "@/types";
+import { fetchWithAuth } from "@/lib/api";
+import {
+  Film,
+  Users,
+  Copy,
+  Check,
+  Tv,
+  AlertCircle,
+  Loader2,
+  ArrowLeft,
+} from "lucide-react";
+import Link from "next/link";
+
+export default function RoomPage({ params }: { params: Promise<{ code: string }> }) {
+  const resolvedParams = use(params);
+  const roomCode = resolvedParams.code;
+
+  const { user, loading } = useAuth();
+  const router = useRouter();
+
+  const [room, setRoom] = useState<IRoom | null>(null);
+  const [loadingRoom, setLoadingRoom] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  // WebRTC & Media States
+  const [localStream, setLocalStream] = useState<MediaStream | null>(null);
+  const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
+  const webrtcManager = useRef<WebRTCManager | null>(null);
+
+  // Real-time Playback Sync
+  const [incomingAction, setIncomingAction] = useState<PlaybackAction | null>(null);
+
+  // In-room Chat
+  const [isChatOpen, setIsChatOpen] = useState(false);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [unreadChatCount, setUnreadChatCount] = useState(0);
+
+  // Signaling state
+  const lastSignalTime = useRef<number>(0);
+  const hasInitiatedCall = useRef(false);
+
+  // Check auth
+  useEffect(() => {
+    if (!loading && !user) {
+      router.push(`/login?redirect=/room/${roomCode}`);
+    }
+  }, [user, loading, router, roomCode]);
+
+  // Load and join room
+  useEffect(() => {
+    if (!user) return;
+
+    let isMounted = true;
+
+    async function loadAndJoin() {
+      try {
+        const joinRes = await fetchWithAuth(`/api/rooms/${roomCode}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "join" }),
+        });
+
+        const joinData = await joinRes.json();
+        if (!joinRes.ok) {
+          throw new Error(joinData.error || "Failed to join room");
+        }
+
+        if (isMounted) {
+          setRoom(joinData.room);
+          setLoadingRoom(false);
+        }
+      } catch (err: any) {
+        if (isMounted) {
+          setError(err.message || "Could not load room");
+          setLoadingRoom(false);
+        }
+      }
+    }
+
+    loadAndJoin();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [user, roomCode]);
+
+  // Initialize WebRTC and Local Camera/Mic
+  useEffect(() => {
+    if (!user || !room) return;
+
+    const isHost = room.hostUserId === user.id;
+
+    const rtc = new WebRTCManager({
+      onRemoteStream: (stream) => {
+        console.log("[WebRTC] Remote video stream received!");
+        setRemoteStream(stream);
+      },
+      onDataChannelMessage: (action) => {
+        handleReceivedAction(action);
+      },
+      onSignalNeeded: async (type, payload) => {
+        const recipientId = isHost ? room.guestUserId : room.hostUserId;
+        // 1. Fast path: Send over Socket.IO (<10ms)
+        sendSocketSignal(roomCode, recipientId, type, payload);
+
+        // 2. Slow path: Fallback HTTP signaling
+        try {
+          await fetchWithAuth(`/api/rooms/${roomCode}/signal`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              type,
+              recipientId,
+              payload,
+            }),
+          });
+        } catch {
+          // Handled by socket
+        }
+      },
+    });
+
+    webrtcManager.current = rtc;
+
+    // Start local webcam & microphone
+    rtc.initializeLocalMedia(true, true).then((stream) => {
+      if (stream) {
+        setLocalStream(stream);
+        rtc.setupPeerConnection(isHost);
+
+        // If host and guest is already present, create offer immediately
+        if (isHost && room.guestUserId && !hasInitiatedCall.current) {
+          hasInitiatedCall.current = true;
+          rtc.createOffer().then((offer) => {
+            if (offer) {
+              sendSocketSignal(roomCode, room.guestUserId, "offer", offer);
+              fetchWithAuth(`/api/rooms/${roomCode}/signal`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                  type: "offer",
+                  recipientId: room.guestUserId,
+                  payload: offer,
+                }),
+              }).catch(() => {});
+            }
+          });
+        }
+      }
+    });
+
+    return () => {
+      rtc.destroy();
+      webrtcManager.current = null;
+    };
+  }, [user, room?.hostUserId, room?.guestUserId, roomCode]);
+
+  // Real-Time Socket.IO Listeners (Instant WebRTC Signaling, Playback Sync & Chat)
+  useEffect(() => {
+    if (!user || !room) return;
+
+    const isHost = room.hostUserId === user.id;
+    joinSocketRoom(roomCode, user.id, user.name, isHost);
+
+    const socket = getSocket();
+    if (!socket) return;
+
+    const onSocketSignal = (data: { senderId: string; type: any; payload: any }) => {
+      handleIncomingSignal(
+        {
+          id: String(Date.now()),
+          roomCode,
+          senderId: data.senderId,
+          type: data.type,
+          payload: data.payload,
+          createdAt: Date.now(),
+        },
+        isHost
+      );
+    };
+
+    const onSocketVideoAction = (data: { action: PlaybackAction }) => {
+      if (data && data.action) {
+        handleReceivedAction(data.action);
+      }
+    };
+
+    const onSocketSelectVideo = (data: { video: IVideo }) => {
+      if (data && data.video) {
+        setRoom((prev) => (prev ? { ...prev, selectedVideo: data.video } : null));
+        addChatMessage({
+          id: String(Date.now()),
+          sender: "System",
+          text: `Selected video changed to "${data.video.title}"`,
+          isSystem: true,
+          timestamp: Date.now(),
+        });
+      }
+    };
+
+    const onSocketUserJoined = (data: { userId: string; username: string }) => {
+      addChatMessage({
+        id: String(Date.now()),
+        sender: "System",
+        text: `${data.username} joined the party!`,
+        isSystem: true,
+        timestamp: Date.now(),
+      });
+
+      // Host triggers WebRTC offer immediately to newly joined peer
+      if (isHost && webrtcManager.current && !hasInitiatedCall.current) {
+        hasInitiatedCall.current = true;
+        webrtcManager.current.createOffer().then((offer) => {
+          if (offer) {
+            sendSocketSignal(roomCode, data.userId, "offer", offer);
+            fetchWithAuth(`/api/rooms/${roomCode}/signal`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                type: "offer",
+                recipientId: data.userId,
+                payload: offer,
+              }),
+            }).catch(() => {});
+          }
+        });
+      }
+    };
+
+    const onSocketUserLeft = (data: { username: string }) => {
+      addChatMessage({
+        id: String(Date.now()),
+        sender: "System",
+        text: `${data.username} left the party.`,
+        isSystem: true,
+        timestamp: Date.now(),
+      });
+      setRemoteStream(null);
+      hasInitiatedCall.current = false;
+    };
+
+    const onSocketChatMessage = (msg: any) => {
+      addChatMessage({
+        id: msg.id || String(Date.now()),
+        sender: msg.sender,
+        text: msg.text,
+        timestamp: msg.timestamp || Date.now(),
+      });
+    };
+
+    socket.on("signal", onSocketSignal);
+    socket.on("video-action", onSocketVideoAction);
+    socket.on("select-video", onSocketSelectVideo);
+    socket.on("user-joined", onSocketUserJoined);
+    socket.on("user-left", onSocketUserLeft);
+    socket.on("chat-message", onSocketChatMessage);
+
+    return () => {
+      socket.off("signal", onSocketSignal);
+      socket.off("video-action", onSocketVideoAction);
+      socket.off("select-video", onSocketSelectVideo);
+      socket.off("user-joined", onSocketUserJoined);
+      socket.off("user-left", onSocketUserLeft);
+      socket.off("chat-message", onSocketChatMessage);
+    };
+  }, [user, room?.hostUserId, roomCode]);
+
+  // Polling Fallback for Room Metadata (Guest joined or video changed via REST)
+  useEffect(() => {
+    if (!user || !room) return;
+
+    const isHost = room.hostUserId === user.id;
+
+    const interval = setInterval(async () => {
+      try {
+        // Poll room updates
+        const roomRes = await fetchWithAuth(`/api/rooms/${roomCode}`);
+        if (roomRes.ok) {
+          const data = await roomRes.json();
+          const latestRoom: IRoom = data.room;
+          setRoom(latestRoom);
+
+          if (
+            isHost &&
+            latestRoom.guestUserId &&
+            !hasInitiatedCall.current &&
+            webrtcManager.current
+          ) {
+            hasInitiatedCall.current = true;
+            webrtcManager.current.createOffer().then((offer) => {
+              if (offer) {
+                sendSocketSignal(roomCode, latestRoom.guestUserId, "offer", offer);
+                fetchWithAuth(`/api/rooms/${roomCode}/signal`, {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    type: "offer",
+                    recipientId: latestRoom.guestUserId,
+                    payload: offer,
+                  }),
+                }).catch(() => {});
+              }
+            });
+          }
+        }
+      } catch (err) {
+        // Silent fallback polling
+      }
+    }, 2500);
+
+    return () => clearInterval(interval);
+  }, [user, room?.hostUserId, roomCode]);
+
+  // Process incoming WebRTC & Sync signals
+  const handleIncomingSignal = async (signal: ISignalMessage, isHost: boolean) => {
+    const rtc = webrtcManager.current;
+    if (!rtc) return;
+
+    switch (signal.type) {
+      case "offer":
+        if (!isHost) {
+          const answer = await rtc.handleOffer(signal.payload);
+          if (answer) {
+            sendSocketSignal(roomCode, signal.senderId, "answer", answer);
+            fetchWithAuth(`/api/rooms/${roomCode}/signal`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                type: "answer",
+                recipientId: signal.senderId,
+                payload: answer,
+              }),
+            }).catch(() => {});
+          }
+        }
+        break;
+
+      case "answer":
+        if (isHost) {
+          await rtc.handleAnswer(signal.payload);
+        }
+        break;
+
+      case "ice-candidate":
+        await rtc.handleIceCandidate(signal.payload);
+        break;
+
+      case "sync-action":
+        handleReceivedAction(signal.payload);
+        break;
+
+      case "select-video":
+        if (signal.payload.video) {
+          setRoom((prev) => (prev ? { ...prev, selectedVideo: signal.payload.video } : null));
+          addChatMessage({
+            id: String(Date.now()),
+            sender: "System",
+            text: `Selected video changed to "${signal.payload.video.title}"`,
+            isSystem: true,
+            timestamp: Date.now(),
+          });
+        }
+        break;
+    }
+  };
+
+  // Dispatch sync action to peer (via WebRTC DataChannel + Socket.IO + API fallback)
+  const handleSendAction = (action: PlaybackAction) => {
+    const rtc = webrtcManager.current;
+    // 1. P2P DataChannel (<5ms)
+    rtc?.sendAction(action);
+
+    // 2. Socket.IO Broadcast (<15ms)
+    sendSocketVideoAction(roomCode, action);
+
+    // 3. Fallback to API if peer is disconnected
+    if (user && room) {
+      const recipientId = room.hostUserId === user.id ? room.guestUserId : room.hostUserId;
+      fetchWithAuth(`/api/rooms/${roomCode}/signal`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          type: "sync-action",
+          recipientId,
+          payload: action,
+        }),
+      }).catch(() => {});
+    }
+
+    // Persist playback state to room in DB
+    if (action.type === "PLAY" || action.type === "PAUSE" || action.type === "SEEK") {
+      fetchWithAuth(`/api/rooms/${roomCode}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "update-playback",
+          isPlaying: action.type === "PLAY",
+          currentTime: action.currentTime,
+        }),
+      }).catch(() => {});
+    }
+  };
+
+  // Handle incoming playback sync action
+  const handleReceivedAction = (action: PlaybackAction) => {
+    setIncomingAction(action);
+
+    if (action.type === "CHAT") {
+      addChatMessage({
+        id: String(Date.now() + Math.random()),
+        sender: action.sender,
+        text: action.message,
+        timestamp: action.timestamp,
+      });
+      if (!isChatOpen) {
+        setUnreadChatCount((prev) => prev + 1);
+      }
+    } else if (action.type === "CACHE_STATUS") {
+      addChatMessage({
+        id: String(Date.now()),
+        sender: "System",
+        text: `Partner cached 100% locally for zero-buffer playback!`,
+        isSystem: true,
+        timestamp: Date.now(),
+      });
+    }
+  };
+
+  const addChatMessage = (msg: ChatMessage) => {
+    setChatMessages((prev) => [...prev, msg]);
+  };
+
+  const handleSendMessage = (text: string) => {
+    if (!user) return;
+    const chatMsg = {
+      id: String(Date.now()),
+      sender: user.name,
+      text,
+      timestamp: Date.now(),
+    };
+    sendSocketChatMessage(roomCode, chatMsg);
+    handleSendAction({
+      type: "CHAT",
+      message: text,
+      sender: user.name,
+      timestamp: Date.now(),
+    });
+    addChatMessage({
+      id: String(Date.now()),
+      sender: "You",
+      text,
+      timestamp: Date.now(),
+    });
+  };
+
+  const handleLeaveRoom = () => {
+    webrtcManager.current?.destroy();
+    disconnectSocket();
+    router.push("/dashboard");
+  };
+
+  if (loadingRoom || !user) {
+    return (
+      <div className="min-h-screen bg-cinema-950 flex items-center justify-center">
+        <div className="flex flex-col items-center space-y-3">
+          <Loader2 className="w-8 h-8 animate-spin text-brand-500" />
+          <p className="text-sm text-slate-400">Connecting to watch party {roomCode}...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (error || !room) {
+    return (
+      <div className="min-h-screen bg-cinema-950 flex items-center justify-center p-4">
+        <div className="max-w-md w-full rounded-2xl bg-cinema-900 border border-slate-800 p-6 text-center space-y-4">
+          <AlertCircle className="w-12 h-12 text-red-400 mx-auto" />
+          <h2 className="text-lg font-bold text-white">Cannot Enter Room</h2>
+          <p className="text-xs text-slate-400">{error || "Room is full or no longer exists."}</p>
+          <Link
+            href="/dashboard"
+            className="inline-flex items-center space-x-2 px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-white text-xs font-medium"
+          >
+            <ArrowLeft className="w-4 h-4" />
+            <span>Return to Dashboard</span>
+          </Link>
+        </div>
+      </div>
+    );
+  }
+
+  const isHost = room.hostUserId === user.id;
+  const partnerName = isHost ? room.guestName || "" : room.hostName;
+
+  return (
+    <div className="min-h-screen bg-cinema-950 text-slate-100 flex flex-col">
+      <Navbar />
+
+      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-4 sm:py-6 flex flex-col">
+        {/* Room Header Info */}
+        <div className="flex items-center justify-between pb-4 border-b border-slate-800/80 mb-4">
+          <div className="flex items-center space-x-3">
+            <Link
+              href="/dashboard"
+              className="p-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-white transition-colors"
+              title="Leave to Dashboard"
+            >
+              <ArrowLeft className="w-4 h-4" />
+            </Link>
+            <div>
+              <div className="flex items-center space-x-2">
+                <h1 className="text-lg font-bold text-white tracking-tight">
+                  {room.selectedVideo?.title || "Co-Watching Room"}
+                </h1>
+                <span className="font-mono text-xs font-bold text-brand-300 bg-brand-500/10 border border-brand-500/20 px-2 py-0.5 rounded-md">
+                  #{roomCode}
+                </span>
+              </div>
+              <p className="text-xs text-slate-400">
+                {partnerName ? `Watching with ${partnerName}` : "Waiting for partner to join..."}
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center space-x-2">
+            <div className="flex items-center space-x-1.5 px-3 py-1 rounded-full bg-slate-900 border border-slate-800 text-xs text-slate-300">
+              <Users className="w-3.5 h-3.5 text-brand-400" />
+              <span>{room.guestUserId ? "2/2 Viewers" : "1/2 Viewers"}</span>
+            </div>
+          </div>
+        </div>
+
+        {/* Video Player (Main View) */}
+        <div className="flex-1 flex flex-col justify-center">
+          {room.selectedVideo ? (
+            <VideoPlayer
+              video={room.selectedVideo as IVideo}
+              roomCode={roomCode}
+              isHost={isHost}
+              onSendAction={handleSendAction}
+              incomingAction={incomingAction}
+            />
+          ) : (
+            <div className="aspect-video bg-cinema-900/60 border border-slate-800 rounded-2xl flex flex-col items-center justify-center p-8 text-center space-y-4">
+              <Film className="w-12 h-12 text-slate-600" />
+              <h2 className="text-base font-semibold text-white">No Video Selected Yet</h2>
+              <p className="text-xs text-slate-400 max-w-sm">
+                Pick a video from your portfolio or your partner&apos;s portfolio to begin watching.
+              </p>
+              <Link
+                href="/dashboard"
+                className="px-4 py-2 rounded-xl bg-brand-600 text-white text-xs font-medium"
+              >
+                Go to Portfolio
+              </Link>
+            </div>
+          )}
+        </div>
+
+        {/* Google Meet-Style Bottom Conference Bar (Dual Camera Feeds + Controls) */}
+        <MeetConferenceBar
+          localStream={localStream}
+          remoteStream={remoteStream}
+          currentUser={user}
+          partnerName={partnerName}
+          isHost={isHost}
+          roomCode={roomCode}
+          onToggleMic={(enabled) => webrtcManager.current?.toggleAudio(enabled)}
+          onToggleCam={(enabled) => webrtcManager.current?.toggleVideo(enabled)}
+          onToggleChat={() => {
+            setIsChatOpen(!isChatOpen);
+            setUnreadChatCount(0);
+          }}
+          onLeaveRoom={handleLeaveRoom}
+          unreadCount={unreadChatCount}
+        />
+      </main>
+
+      {/* In-Room Chat Drawer */}
+      <ChatSidebar
+        isOpen={isChatOpen}
+        onClose={() => setIsChatOpen(false)}
+        messages={chatMessages}
+        onSendMessage={handleSendMessage}
+        currentUserName={user.name}
+      />
+    </div>
+  );
+}
