@@ -63,6 +63,77 @@ app.get("/api/ice-servers", (req, res) => {
   res.json({ iceServers: defaultIceServers });
 });
 
+// S3 Configuration & Presigned URL generator on backend server
+let s3ClientInstance = null;
+const s3Region = process.env.S3_REGION || process.env.AWS_REGION || "us-east-1";
+const s3AccessKeyId = process.env.S3_ACCESS_KEY_ID || process.env.AWS_ACCESS_KEY_ID;
+const s3SecretAccessKey = process.env.S3_SECRET_ACCESS_KEY || process.env.AWS_SECRET_ACCESS_KEY;
+const s3BucketName = process.env.S3_BUCKET_NAME || process.env.AWS_S3_BUCKET_NAME;
+
+function isServerS3Configured() {
+  return Boolean(s3AccessKeyId && s3SecretAccessKey && s3BucketName);
+}
+
+function getServerS3Client() {
+  if (!isServerS3Configured()) return null;
+  if (!s3ClientInstance) {
+    const { S3Client } = require("@aws-sdk/client-s3");
+    s3ClientInstance = new S3Client({
+      region: s3Region,
+      credentials: {
+        accessKeyId: s3AccessKeyId,
+        secretAccessKey: s3SecretAccessKey,
+      },
+    });
+  }
+  return s3ClientInstance;
+}
+
+app.post("/api/videos/presigned-url", async (req, res) => {
+  try {
+    if (!isServerS3Configured()) {
+      return res.json({
+        isS3Configured: false,
+        message: "S3 is not configured on the backend server.",
+      });
+    }
+
+    const { userId = "guest", fileName, contentType = "video/mp4" } = req.body || {};
+    if (!fileName) {
+      return res.status(400).json({ error: "fileName is required" });
+    }
+
+    const client = getServerS3Client();
+    const { PutObjectCommand } = require("@aws-sdk/client-s3");
+    const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
+
+    const sanitized = fileName.replace(/[^a-zA-Z0-9.-]/g, "_");
+    const uniqueId = Math.random().toString(36).substring(2, 10);
+    const folderPath = `users/${userId}/videos`;
+    const s3Key = `${folderPath}/${Date.now()}_${uniqueId}_${sanitized}`;
+
+    const command = new PutObjectCommand({
+      Bucket: s3BucketName,
+      Key: s3Key,
+      ContentType: contentType,
+    });
+
+    const uploadUrl = await getSignedUrl(client, command, { expiresIn: 1800 });
+    const fileUrl = `https://${s3BucketName}.s3.${s3Region}.amazonaws.com/${s3Key}`;
+
+    return res.json({
+      isS3Configured: true,
+      uploadUrl,
+      fileUrl,
+      s3Key,
+      folderPath,
+    });
+  } catch (err) {
+    console.error("❌ [S3 Presigned URL Error]:", err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // Socket.IO Real-Time Signaling & Playback Sync
 io.on("connection", (socket) => {
   console.log(`[Socket Connected] id=${socket.id}`);
