@@ -24,6 +24,9 @@ export function getS3Client(): S3Client | null {
         accessKeyId: accessKeyId!,
         secretAccessKey: secretAccessKey!,
       },
+      // Prevent AWS SDK v3 from adding automatic CRC32 checksum query params to presigned URLs
+      requestChecksumCalculation: "WHEN_REQUIRED",
+      responseChecksumValidation: "WHEN_REQUIRED",
     });
   }
   return s3ClientInstance;

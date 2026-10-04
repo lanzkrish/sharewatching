@@ -91,59 +91,72 @@ export default function UploadVideoModal({ isOpen, onClose, onVideoUploaded }: U
 
       const presignedData = await presignedRes.json();
 
+      let uploadedSuccessfully = false;
+
       if (presignedData.isS3Configured && presignedData.uploadUrl) {
         // Upload directly to Amazon S3 via XMLHttpRequest to track progress
         setStorageType("s3");
-        await new Promise<void>((resolve, reject) => {
-          const xhr = new XMLHttpRequest();
-          xhr.open("PUT", presignedData.uploadUrl, true);
-          xhr.setRequestHeader("Content-Type", file.type || "video/mp4");
+        try {
+          await new Promise<void>((resolve, reject) => {
+            const xhr = new XMLHttpRequest();
+            xhr.open("PUT", presignedData.uploadUrl, true);
+            xhr.setRequestHeader("Content-Type", file.type || "video/mp4");
 
-          xhr.upload.onprogress = (e) => {
-            if (e.lengthComputable) {
-              const percent = Math.round((e.loaded / e.total) * 95);
-              setUploadProgress(percent);
-            }
-          };
+            xhr.upload.onprogress = (e) => {
+              if (e.lengthComputable) {
+                const percent = Math.round((e.loaded / e.total) * 95);
+                setUploadProgress(percent);
+              }
+            };
 
-          xhr.onload = () => {
-            if (xhr.status >= 200 && xhr.status < 300) {
-              setUploadProgress(100);
-              resolve();
-            } else {
-              reject(new Error(`S3 upload failed with status ${xhr.status}`));
-            }
-          };
+            xhr.onload = () => {
+              if (xhr.status >= 200 && xhr.status < 300) {
+                setUploadProgress(100);
+                resolve();
+              } else {
+                reject(new Error(`S3 upload failed with status ${xhr.status}`));
+              }
+            };
 
-          xhr.onerror = () => reject(new Error("Network error during S3 upload"));
-          xhr.send(file);
-        });
+            xhr.onerror = () => reject(new Error("Network error during S3 upload"));
+            xhr.send(file);
+          });
 
-        // Save video record in database
-        const recordRes = await fetchWithAuth("/api/videos", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            title,
-            description,
-            s3Key: presignedData.s3Key,
-            url: presignedData.fileUrl,
-            isLocal: false,
-            fileSize: file.size,
-            duration: Math.round(duration),
-            mimeType: file.type || "video/mp4",
-          }),
-        });
+          // Save video record in database
+          const recordRes = await fetchWithAuth("/api/videos", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              title,
+              description,
+              s3Key: presignedData.s3Key,
+              url: presignedData.fileUrl,
+              isLocal: false,
+              fileSize: file.size,
+              duration: Math.round(duration),
+              mimeType: file.type || "video/mp4",
+            }),
+          });
 
-        const recordData = await recordRes.json();
-        if (recordRes.ok && recordData.video) {
-          onVideoUploaded(recordData.video);
-          handleClose();
-        } else {
-          throw new Error(recordData.error || "Failed to record video details");
+          const recordData = await recordRes.json();
+          if (recordRes.ok && recordData.video) {
+            uploadedSuccessfully = true;
+            onVideoUploaded(recordData.video);
+            handleClose();
+          } else {
+            throw new Error(recordData.error || "Failed to record video details");
+          }
+        } catch (s3Err: any) {
+          console.warn(
+            "[Upload] S3 upload failed (likely S3 bucket CORS permissions not yet configured on AWS). Falling back to direct streaming storage...",
+            s3Err
+          );
+          setUploadProgress(0);
         }
-      } else {
-        // Fallback: Local Server Upload (Zero-RAM streaming directly into disk)
+      }
+
+      // If S3 was not configured or S3 upload failed (e.g. CORS 403), use zero-RAM streaming local storage
+      if (!uploadedSuccessfully) {
         setStorageType("local");
 
         const xhr = new XMLHttpRequest();

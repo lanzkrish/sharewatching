@@ -54,16 +54,31 @@ export default function MeetConferenceBar({
   // Attach local stream to local video element
   useEffect(() => {
     if (localVideoRef.current && localStream) {
-      localVideoRef.current.srcObject = localStream;
+      if (localVideoRef.current.srcObject !== localStream) {
+        localVideoRef.current.srcObject = localStream;
+      }
+      localVideoRef.current.play().catch(() => {});
     }
-  }, [localStream]);
+  }, [localStream, isCamOn]);
 
   // Attach remote stream to remote video element
   useEffect(() => {
     if (remoteVideoRef.current && remoteStream) {
-      remoteVideoRef.current.srcObject = remoteStream;
+      if (remoteVideoRef.current.srcObject !== remoteStream) {
+        remoteVideoRef.current.srcObject = remoteStream;
+      }
+      remoteVideoRef.current.play().catch((err) => {
+        console.warn("[MeetConferenceBar] remote video play warning:", err);
+      });
     }
   }, [remoteStream]);
+
+  // User interaction fallback to ensure video/audio plays if browser autoplay blocked it
+  const handleTileClick = () => {
+    if (remoteVideoRef.current && remoteStream) {
+      remoteVideoRef.current.play().catch(() => {});
+    }
+  };
 
   const handleMicToggle = () => {
     const next = !isMicOn;
@@ -89,15 +104,24 @@ export default function MeetConferenceBar({
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         {/* Local Participant Card */}
         <div className="relative aspect-video sm:h-52 bg-slate-900/90 rounded-2xl overflow-hidden border border-slate-800 shadow-xl group">
-          {localStream && isCamOn ? (
-            <video
-              ref={localVideoRef}
-              autoPlay
-              playsInline
-              muted
-              className="w-full h-full object-cover transform -scale-x-100"
-            />
-          ) : (
+          <video
+            ref={(el) => {
+              localVideoRef.current = el;
+              if (el && localStream && el.srcObject !== localStream) {
+                el.srcObject = localStream;
+              }
+              if (el && localStream && isCamOn) {
+                el.play().catch(() => {});
+              }
+            }}
+            autoPlay
+            playsInline
+            muted
+            className={`w-full h-full object-cover transform -scale-x-100 ${
+              localStream && isCamOn ? "block" : "hidden"
+            }`}
+          />
+          {(!localStream || !isCamOn) && (
             <div className="w-full h-full flex flex-col items-center justify-center bg-gradient-to-b from-slate-900 to-cinema-950">
               <div className="w-16 h-16 rounded-full bg-brand-500/20 border-2 border-brand-500/40 flex items-center justify-center text-brand-300 text-xl font-bold mb-2">
                 {currentUser.name.charAt(0).toUpperCase()}
@@ -128,15 +152,27 @@ export default function MeetConferenceBar({
         </div>
 
         {/* Remote Participant Card */}
-        <div className="relative aspect-video sm:h-52 bg-slate-900/90 rounded-2xl overflow-hidden border border-slate-800 shadow-xl group">
-          {remoteStream ? (
-            <video
-              ref={remoteVideoRef}
-              autoPlay
-              playsInline
-              className="w-full h-full object-cover"
-            />
-          ) : (
+        <div
+          onClick={handleTileClick}
+          className="relative aspect-video sm:h-52 bg-slate-900/90 rounded-2xl overflow-hidden border border-slate-800 shadow-xl group cursor-pointer"
+        >
+          <video
+            ref={(el) => {
+              remoteVideoRef.current = el;
+              if (el && remoteStream && el.srcObject !== remoteStream) {
+                el.srcObject = remoteStream;
+              }
+              if (el && remoteStream) {
+                el.play().catch((e) => {
+                  console.warn("[MeetConferenceBar] waiting for interaction:", e);
+                });
+              }
+            }}
+            autoPlay
+            playsInline
+            className={`w-full h-full object-cover ${remoteStream ? "block" : "hidden"}`}
+          />
+          {!remoteStream && (
             <div className="w-full h-full flex flex-col items-center justify-center bg-gradient-to-b from-slate-900 to-cinema-950 p-4 text-center">
               <div className="w-16 h-16 rounded-full bg-indigo-500/20 border-2 border-indigo-500/40 flex items-center justify-center text-indigo-300 text-xl font-bold mb-2">
                 {partnerName ? partnerName.charAt(0).toUpperCase() : <Users className="w-6 h-6" />}

@@ -156,39 +156,66 @@ export default function RoomPage({ params }: { params: Promise<{ code: string }>
     };
   }, [user, roomCode]);
 
-  // Initialize WebRTC and Local Camera/Mic
-  useEffect(() => {
-    if (!user || !room) return;
+  // Helper to send WebRTC offer from host
+  const sendOffer = async (targetUserId?: string) => {
+    const rtc = webrtcManager.current;
+    if (!rtc) return;
+    try {
+      console.log("[WebRTC] Host generating offer...");
+      const offer = await rtc.createOffer();
+      const currentStream = rtc.getLocalStream();
+      if (currentStream) {
+        setLocalStream(currentStream);
+      }
+      if (offer) {
+        console.log("[WebRTC] Sending offer to peer:", targetUserId || "all");
+        sendSocketSignal(roomCode, targetUserId, "offer", offer);
+        fetchWithAuth(`/api/rooms/${roomCode}/signal`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            type: "offer",
+            recipientId: targetUserId,
+            payload: offer,
+          }),
+        }).catch(() => {});
+      }
+    } catch (e) {
+      console.warn("[WebRTC] Error creating offer:", e);
+    }
+  };
 
-    const isHost = room.hostUserId === user.id;
+  // Initialize WebRTC and Local Camera/Mic once on mount
+  useEffect(() => {
+    if (!user) return;
+
+    let isMounted = true;
 
     const rtc = new WebRTCManager({
       onRemoteStream: (stream) => {
-        console.log("[WebRTC] Remote video stream received!");
-        setRemoteStream(stream);
+        console.log("[WebRTC] ✅ Remote video stream attached to state!", stream.getTracks());
+        if (isMounted) {
+          setRemoteStream(stream);
+        }
       },
       onDataChannelMessage: (action) => {
         handleReceivedAction(action);
       },
       onSignalNeeded: async (type, payload) => {
-        const recipientId = isHost ? room.guestUserId : room.hostUserId;
-        // 1. Fast path: Send over Socket.IO (<10ms)
-        sendSocketSignal(roomCode, recipientId, type, payload);
+        // Fast path: Socket.IO (<10ms)
+        sendSocketSignal(roomCode, undefined, type, payload);
 
-        // 2. Slow path: Fallback HTTP signaling
+        // Fallback: HTTP signaling
         try {
           await fetchWithAuth(`/api/rooms/${roomCode}/signal`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
               type,
-              recipientId,
               payload,
             }),
           });
-        } catch {
-          // Handled by socket
-        }
+        } catch {}
       },
     });
 
@@ -196,36 +223,28 @@ export default function RoomPage({ params }: { params: Promise<{ code: string }>
 
     // Start local webcam & microphone
     rtc.initializeLocalMedia(true, true).then((stream) => {
-      if (stream) {
+      if (stream && isMounted) {
         setLocalStream(stream);
         rtc.setupPeerConnection(isHost);
-
-        // If host and guest is already present, create offer immediately
-        if (isHost && room.guestUserId && !hasInitiatedCall.current) {
-          hasInitiatedCall.current = true;
-          rtc.createOffer().then((offer) => {
-            if (offer) {
-              sendSocketSignal(roomCode, room.guestUserId, "offer", offer);
-              fetchWithAuth(`/api/rooms/${roomCode}/signal`, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  type: "offer",
-                  recipientId: room.guestUserId,
-                  payload: offer,
-                }),
-              }).catch(() => {});
-            }
-          });
-        }
       }
     });
 
     return () => {
+      isMounted = false;
       rtc.destroy();
       webrtcManager.current = null;
     };
-  }, [user, room?.hostUserId, room?.guestUserId, roomCode]);
+  }, [user?.id, roomCode]);
+
+  // Host triggers call when guest is detected
+  useEffect(() => {
+    if (!user || !room) return;
+    const isRoomHost = room.hostUserId === user.id;
+    if (isRoomHost && room.guestUserId && !hasInitiatedCall.current) {
+      hasInitiatedCall.current = true;
+      sendOffer(room.guestUserId);
+    }
+  }, [user?.id, room?.hostUserId, room?.guestUserId]);
 
   // Real-Time Socket.IO Listeners (Instant WebRTC Signaling, Playback Sync & Chat)
   useEffect(() => {
@@ -280,22 +299,20 @@ export default function RoomPage({ params }: { params: Promise<{ code: string }>
       });
 
       // Host triggers WebRTC offer immediately to newly joined peer
-      if (isHost && webrtcManager.current && !hasInitiatedCall.current) {
+      if (isHost) {
         hasInitiatedCall.current = true;
-        webrtcManager.current.createOffer().then((offer) => {
-          if (offer) {
-            sendSocketSignal(roomCode, data.userId, "offer", offer);
-            fetchWithAuth(`/api/rooms/${roomCode}/signal`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                type: "offer",
-                recipientId: data.userId,
-                payload: offer,
-              }),
-            }).catch(() => {});
-          }
-        });
+        sendOffer(data.userId);
+      }
+    };
+
+    const onSocketRoomUsers = (data: { users: Array<{ userId: string; username: string; isHost: boolean }> }) => {
+      if (isHost && data.users && data.users.length > 0) {
+        const guest = data.users.find((u) => !u.isHost) || data.users[0];
+        if (guest && guest.userId !== user.id) {
+          console.log("[WebRTC] Host detected existing guest from room-users, sending offer to:", guest.userId);
+          hasInitiatedCall.current = true;
+          sendOffer(guest.userId);
+        }
       }
     };
 
@@ -334,6 +351,7 @@ export default function RoomPage({ params }: { params: Promise<{ code: string }>
     socket.on("video-action", onSocketVideoAction);
     socket.on("select-video", onSocketSelectVideo);
     socket.on("user-joined", onSocketUserJoined);
+    socket.on("room-users", onSocketRoomUsers);
     socket.on("user-left", onSocketUserLeft);
     socket.on("chat-message", onSocketChatMessage);
     socket.on("room-closed", onSocketRoomClosed);
@@ -343,6 +361,7 @@ export default function RoomPage({ params }: { params: Promise<{ code: string }>
       socket.off("video-action", onSocketVideoAction);
       socket.off("select-video", onSocketSelectVideo);
       socket.off("user-joined", onSocketUserJoined);
+      socket.off("room-users", onSocketRoomUsers);
       socket.off("user-left", onSocketUserLeft);
       socket.off("chat-message", onSocketChatMessage);
       socket.off("room-closed", onSocketRoomClosed);
@@ -390,24 +409,10 @@ export default function RoomPage({ params }: { params: Promise<{ code: string }>
           if (
             isHost &&
             latestRoom.guestUserId &&
-            !hasInitiatedCall.current &&
-            webrtcManager.current
+            !hasInitiatedCall.current
           ) {
             hasInitiatedCall.current = true;
-            webrtcManager.current.createOffer().then((offer) => {
-              if (offer) {
-                sendSocketSignal(roomCode, latestRoom.guestUserId, "offer", offer);
-                fetchWithAuth(`/api/rooms/${roomCode}/signal`, {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({
-                    type: "offer",
-                    recipientId: latestRoom.guestUserId,
-                    payload: offer,
-                  }),
-                }).catch(() => {});
-              }
-            });
+            sendOffer(latestRoom.guestUserId);
           }
         }
 
@@ -453,6 +458,10 @@ export default function RoomPage({ params }: { params: Promise<{ code: string }>
       case "offer":
         if (!isHost) {
           const answer = await rtc.handleOffer(signal.payload);
+          const currentStream = rtc.getLocalStream();
+          if (currentStream) {
+            setLocalStream(currentStream);
+          }
           if (answer) {
             sendSocketSignal(roomCode, signal.senderId, "answer", answer);
             fetchWithAuth(`/api/rooms/${roomCode}/signal`, {

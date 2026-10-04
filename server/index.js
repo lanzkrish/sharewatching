@@ -85,6 +85,8 @@ function getServerS3Client() {
         accessKeyId: s3AccessKeyId,
         secretAccessKey: s3SecretAccessKey,
       },
+      requestChecksumCalculation: "WHEN_REQUIRED",
+      responseChecksumValidation: "WHEN_REQUIRED",
     });
   }
   return s3ClientInstance;
