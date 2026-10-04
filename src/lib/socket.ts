@@ -5,30 +5,63 @@ import { PlaybackAction, IVideo, IChatMessage } from "@/types";
 
 let socketInstance: Socket | null = null;
 
-const SOCKET_URL =
-  process.env.NEXT_PUBLIC_SOCKET_URL ||
-  (typeof window !== "undefined" && window.location.hostname === "localhost"
-    ? "http://localhost:5008"
-    : "");
+function getSocketUrl(): string {
+  if (typeof window === "undefined") return "";
+
+  const envUrl = process.env.NEXT_PUBLIC_SOCKET_URL?.trim();
+  const isHttps = window.location.protocol === "https:";
+
+  // 1. Localhost development
+  if (window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1") {
+    return envUrl || "http://localhost:5008";
+  }
+
+  // 2. If envUrl is explicitly provided
+  if (envUrl) {
+    // If the live page is loaded over HTTPS, but envUrl is HTTP (like http://64.227.172.18:5008),
+    // modern browsers immediately block it as Mixed Content!
+    // We seamlessly route it via the same-origin HTTPS proxy (/socket.io) in netlify.toml
+    if (isHttps && envUrl.startsWith("http://")) {
+      console.warn(
+        `[Socket.IO] Insecure HTTP socket URL (${envUrl}) detected on HTTPS page. Routing via same-origin proxy to prevent browser Mixed Content block.`
+      );
+      return window.location.origin;
+    }
+    return envUrl;
+  }
+
+  // 3. In production, default to same-origin (proxied to backend via netlify.toml)
+  return window.location.origin;
+}
 
 export function getSocket(): Socket | null {
   if (typeof window === "undefined") return null;
 
-  if (!socketInstance && SOCKET_URL) {
-    socketInstance = io(SOCKET_URL, {
-      transports: ["websocket", "polling"],
+  if (!socketInstance) {
+    const targetUrl = getSocketUrl();
+    console.log(`[Socket.IO] Initializing connection to: ${targetUrl || "same-origin"}`);
+
+    socketInstance = io(targetUrl, {
+      path: "/socket.io",
+      transports: ["polling", "websocket"],
       autoConnect: true,
       reconnection: true,
-      reconnectionAttempts: 10,
+      reconnectionAttempts: Infinity,
       reconnectionDelay: 1000,
+      reconnectionDelayMax: 5000,
+      timeout: 10000,
     });
 
     socketInstance.on("connect", () => {
-      console.log("[Socket.IO] Connected to signaling server:", socketInstance?.id);
+      console.log(`[Socket.IO] ✅ Connected to signaling server! (Socket ID: ${socketInstance?.id})`);
     });
 
     socketInstance.on("connect_error", (err) => {
-      console.warn("[Socket.IO] Connection error (falling back to HTTP signaling if needed):", err.message);
+      console.warn("[Socket.IO] ⚠️ Connection error:", err.message);
+    });
+
+    socketInstance.on("disconnect", (reason) => {
+      console.log("[Socket.IO] Disconnected:", reason);
     });
   }
 

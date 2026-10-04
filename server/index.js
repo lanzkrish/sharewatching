@@ -7,16 +7,17 @@ require("dotenv").config({ path: path.join(__dirname, ".env") });
 
 const PORT = process.env.PORT || 5008;
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
+const allowOrigin = CORS_ORIGIN === "*" ? true : CORS_ORIGIN;
 
 const app = express();
-app.use(cors({ origin: CORS_ORIGIN, credentials: true }));
+app.use(cors({ origin: allowOrigin, credentials: true }));
 app.use(express.json());
 
 const server = http.createServer(app);
 
 const io = new Server(server, {
   cors: {
-    origin: CORS_ORIGIN,
+    origin: allowOrigin,
     methods: ["GET", "POST"],
     credentials: true,
   },

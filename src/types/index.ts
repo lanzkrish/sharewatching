@@ -54,7 +54,7 @@ export interface ISignalMessage {
   roomCode: string;
   senderId: string;
   recipientId?: string;
-  type: "offer" | "answer" | "ice-candidate" | "join" | "leave" | "sync-action" | "select-video" | "start-watch";
+  type: "offer" | "answer" | "ice-candidate" | "join" | "leave" | "sync-action" | "select-video" | "start-watch" | "chat";
   payload: any;
   createdAt: number;
 }

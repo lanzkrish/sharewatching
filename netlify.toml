@@ -7,3 +7,11 @@
 
 [build.environment]
   NODE_VERSION = "20"
+
+# Reverse proxy socket.io connections from HTTPS frontend to backend signaling server
+# This prevents browser Mixed Content blocking (HTTPS -> HTTP) and CORS errors
+[[redirects]]
+  from = "/socket.io/*"
+  to = "http://64.227.172.18:5008/socket.io/:splat"
+  status = 200
+  force = true

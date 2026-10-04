@@ -58,6 +58,7 @@ export default function RoomPage({ params }: { params: Promise<{ code: string }>
 
   // Signaling state
   const lastSignalTime = useRef<number>(0);
+  const lastPlaybackTime = useRef<number>(0);
   const hasInitiatedCall = useRef(false);
 
   // Check auth
@@ -286,20 +287,35 @@ export default function RoomPage({ params }: { params: Promise<{ code: string }>
     };
   }, [user, room?.hostUserId, roomCode]);
 
-  // Polling Fallback for Room Metadata (Guest joined or video changed via REST)
+  // Polling Fallback for Room Metadata & Signals (WebRTC, sync actions, chat)
   useEffect(() => {
     if (!user || !room) return;
 
     const isHost = room.hostUserId === user.id;
+    const handledSignalIds = new Set<string>();
 
     const interval = setInterval(async () => {
       try {
-        // Poll room updates
+        // 1. Poll room updates
         const roomRes = await fetchWithAuth(`/api/rooms/${roomCode}`);
         if (roomRes.ok) {
           const data = await roomRes.json();
           const latestRoom: IRoom = data.room;
           setRoom(latestRoom);
+
+          // If partner updated playback in database, sync incoming action
+          if (
+            latestRoom.playbackState &&
+            latestRoom.playbackState.updatedBy !== user.id &&
+            latestRoom.playbackState.updatedAt > lastPlaybackTime.current
+          ) {
+            lastPlaybackTime.current = latestRoom.playbackState.updatedAt;
+            setIncomingAction({
+              type: latestRoom.playbackState.isPlaying ? "PLAY" : "PAUSE",
+              currentTime: latestRoom.playbackState.currentTime,
+              timestamp: latestRoom.playbackState.updatedAt || Date.now(),
+            });
+          }
 
           if (
             isHost &&
@@ -324,10 +340,27 @@ export default function RoomPage({ params }: { params: Promise<{ code: string }>
             });
           }
         }
+
+        // 2. Poll signals as fallback (WebRTC offers/answers, ICE candidates, sync actions, chat)
+        const signalRes = await fetchWithAuth(
+          `/api/rooms/${roomCode}/signal?since=${lastSignalTime.current}`
+        );
+        if (signalRes.ok) {
+          const signalData = await signalRes.json();
+          const signals: ISignalMessage[] = signalData.signals || [];
+          for (const sig of signals) {
+            if (handledSignalIds.has(sig.id)) continue;
+            handledSignalIds.add(sig.id);
+            if (sig.createdAt > lastSignalTime.current) {
+              lastSignalTime.current = sig.createdAt;
+            }
+            handleIncomingSignal(sig, isHost);
+          }
+        }
       } catch (err) {
         // Silent fallback polling
       }
-    }, 2500);
+    }, 2000);
 
     return () => clearInterval(interval);
   }, [user, room?.hostUserId, roomCode]);
@@ -368,6 +401,17 @@ export default function RoomPage({ params }: { params: Promise<{ code: string }>
 
       case "sync-action":
         handleReceivedAction(signal.payload);
+        break;
+
+      case "chat":
+        if (signal.payload) {
+          addChatMessage({
+            id: signal.id,
+            sender: signal.payload.sender || "Partner",
+            text: signal.payload.text || signal.payload.message || "",
+            timestamp: signal.createdAt,
+          });
+        }
         break;
 
       case "select-video":
