@@ -18,7 +18,7 @@ npm install
 npm run dev
 ```
 
-The server will listen on `http://localhost:5001`.
+The server will listen on `http://localhost:5008`.
 
 ---
 
@@ -98,7 +98,7 @@ server {
     server_name your-domain.com; # or your Droplet IP if no domain
 
     location / {
-        proxy_pass http://127.0.0.1:5001;
+        proxy_pass http://127.0.0.1:5008;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";

@@ -8,7 +8,7 @@ let socketInstance: Socket | null = null;
 const SOCKET_URL =
   process.env.NEXT_PUBLIC_SOCKET_URL ||
   (typeof window !== "undefined" && window.location.hostname === "localhost"
-    ? "http://localhost:5001"
+    ? "http://localhost:5008"
     : "");
 
 export function getSocket(): Socket | null {

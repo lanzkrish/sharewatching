@@ -5,7 +5,7 @@ const cors = require("cors");
 const path = require("path");
 require("dotenv").config({ path: path.join(__dirname, ".env") });
 
-const PORT = process.env.PORT || 5001;
+const PORT = process.env.PORT || 5008;
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
 
 const app = express();
@@ -183,6 +183,24 @@ io.on("connection", (socket) => {
       }
     }
   });
+});
+
+process.on("uncaughtException", (err) => {
+  console.error("❌ [Fatal] Uncaught Exception:", err);
+});
+
+process.on("unhandledRejection", (reason, promise) => {
+  console.error("❌ [Fatal] Unhandled Rejection at:", promise, "reason:", reason);
+});
+
+server.on("error", (err) => {
+  if (err.code === "EADDRINUSE") {
+    console.error(`❌ [Fatal] Port ${PORT} is already in use by another process on this server!`);
+    console.error(`👉 Change PORT in .env to another port (e.g. PORT=5005 or PORT=5050)`);
+  } else {
+    console.error("❌ [Fatal] Server error:", err);
+  }
+  process.exit(1);
 });
 
 server.listen(PORT, () => {
