@@ -232,6 +232,18 @@ io.on("connection", (socket) => {
     io.to(`room:${roomCode}`).emit("chat-message", message);
   });
 
+  // Host Closes & Deletes Room Permanently
+  socket.on("close-room", ({ roomCode, reason }) => {
+    if (!roomCode) return;
+    console.log(`[Room Closed by Host] room=${roomCode}`);
+    io.to(`room:${roomCode}`).emit("room-closed", {
+      roomCode,
+      message: reason || "The host has closed this watch party room and the code has been deleted.",
+    });
+    activeRooms.delete(roomCode);
+    io.in(`room:${roomCode}`).socketsLeave(`room:${roomCode}`);
+  });
+
   // Disconnect & Cleanup
   socket.on("disconnect", () => {
     const session = socketRegistry.get(socket.id);

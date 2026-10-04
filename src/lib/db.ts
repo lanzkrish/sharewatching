@@ -434,6 +434,67 @@ export const db = {
     }
   },
 
+  async closeRoom(code: string, userId: string): Promise<boolean> {
+    const mongo = await connectToDatabase();
+    if (mongo) {
+      const room = await RoomModel.findOne({ code });
+      if (room && (room.hostUserId === userId || !room.hostUserId)) {
+        await RoomModel.deleteOne({ code });
+        return true;
+      }
+      return false;
+    }
+
+    const room = localStore.rooms.get(code);
+    if (room && (room.hostUserId === userId || !room.hostUserId)) {
+      localStore.rooms.delete(code);
+      return true;
+    }
+    return false;
+  },
+
+  async leaveRoom(code: string, userId: string): Promise<IRoom | null> {
+    const mongo = await connectToDatabase();
+    if (mongo) {
+      const room = await RoomModel.findOne({ code });
+      if (!room) return null;
+
+      // If host leaves, delete room permanently
+      if (room.hostUserId === userId) {
+        await RoomModel.deleteOne({ code });
+        return null;
+      }
+
+      // If guest leaves, clear guest slots
+      if (room.guestUserId === userId) {
+        room.guestUserId = undefined as any;
+        room.guestName = undefined as any;
+        room.status = "waiting";
+        await room.save();
+        return mapRoom(room);
+      }
+      return mapRoom(room);
+    }
+
+    const room = localStore.rooms.get(code);
+    if (!room) return null;
+
+    if (room.hostUserId === userId) {
+      localStore.rooms.delete(code);
+      return null;
+    }
+
+    if (room.guestUserId === userId) {
+      delete room.guestUserId;
+      delete room.guestName;
+      room.status = "waiting";
+      room.updatedAt = new Date().toISOString();
+      localStore.rooms.set(code, room);
+      return mapRoom(room);
+    }
+    return mapRoom(room);
+  },
+
   // ================= SIGNALING (WebRTC & Instant Sync) =================
   addSignal(signal: Omit<ISignalMessage, "id" | "createdAt">): ISignalMessage {
     const newSignal: ISignalMessage = {

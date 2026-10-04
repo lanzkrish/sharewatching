@@ -117,6 +117,13 @@ export function sendSocketChatMessage(roomCode: string, message: IChatMessage) {
   }
 }
 
+export function sendSocketCloseRoom(roomCode: string, reason?: string) {
+  const socket = getSocket();
+  if (socket && socket.connected) {
+    socket.emit("close-room", { roomCode, reason });
+  }
+}
+
 export function disconnectSocket() {
   if (socketInstance) {
     socketInstance.disconnect();

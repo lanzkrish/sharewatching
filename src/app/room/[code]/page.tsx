@@ -16,6 +16,7 @@ import {
   sendSocketVideoAction,
   sendSocketSelectVideo,
   sendSocketChatMessage,
+  sendSocketCloseRoom,
   disconnectSocket,
 } from "@/lib/socket";
 import { IRoom, IVideo, PlaybackAction, ISignalMessage } from "@/types";
@@ -29,6 +30,9 @@ import {
   AlertCircle,
   Loader2,
   ArrowLeft,
+  Trash2,
+  LogOut,
+  X,
 } from "lucide-react";
 import Link from "next/link";
 
@@ -60,6 +64,52 @@ export default function RoomPage({ params }: { params: Promise<{ code: string }>
   const lastSignalTime = useRef<number>(0);
   const lastPlaybackTime = useRef<number>(0);
   const hasInitiatedCall = useRef(false);
+
+  // Exit & Room Termination Dialog States
+  const [showExitModal, setShowExitModal] = useState(false);
+  const [isClosingRoom, setIsClosingRoom] = useState(false);
+  const [isRoomTerminated, setIsRoomTerminated] = useState(false);
+  const [terminationMessage, setTerminationMessage] = useState("");
+
+  const isHost = room?.hostUserId === user?.id;
+
+  // Intercept Browser Tab Close / Reload to prompt user
+  useEffect(() => {
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = isHost
+        ? "Leaving this page will permanently close the watch party and delete the room code."
+        : "Are you sure you want to leave this watch party?";
+
+      if (isHost) {
+        sendSocketCloseRoom(roomCode, "Host closed the browser tab.");
+        if (typeof navigator !== "undefined" && navigator.sendBeacon) {
+          navigator.sendBeacon(
+            `/api/rooms/${roomCode}`,
+            new Blob([JSON.stringify({ action: "close" })], { type: "application/json" })
+          );
+        }
+      }
+      return e.returnValue;
+    };
+
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+  }, [isHost, roomCode]);
+
+  // Intercept Browser Back Button to prompt user with modal
+  useEffect(() => {
+    window.history.pushState(null, "", window.location.href);
+
+    const handlePopState = () => {
+      // Re-push state so user doesn't immediately navigate away, show confirmation modal
+      window.history.pushState(null, "", window.location.href);
+      setShowExitModal(true);
+    };
+
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, []);
 
   // Check auth
   useEffect(() => {
@@ -270,12 +320,23 @@ export default function RoomPage({ params }: { params: Promise<{ code: string }>
       });
     };
 
+    const onSocketRoomClosed = (data: { roomCode: string; message?: string }) => {
+      console.log("[Socket.IO] Room closed by host:", data);
+      setIsRoomTerminated(true);
+      setTerminationMessage(
+        data?.message || "The host has closed this watch party and deleted the room code."
+      );
+      webrtcManager.current?.destroy();
+      disconnectSocket();
+    };
+
     socket.on("signal", onSocketSignal);
     socket.on("video-action", onSocketVideoAction);
     socket.on("select-video", onSocketSelectVideo);
     socket.on("user-joined", onSocketUserJoined);
     socket.on("user-left", onSocketUserLeft);
     socket.on("chat-message", onSocketChatMessage);
+    socket.on("room-closed", onSocketRoomClosed);
 
     return () => {
       socket.off("signal", onSocketSignal);
@@ -284,6 +345,7 @@ export default function RoomPage({ params }: { params: Promise<{ code: string }>
       socket.off("user-joined", onSocketUserJoined);
       socket.off("user-left", onSocketUserLeft);
       socket.off("chat-message", onSocketChatMessage);
+      socket.off("room-closed", onSocketRoomClosed);
     };
   }, [user, room?.hostUserId, roomCode]);
 
@@ -298,6 +360,14 @@ export default function RoomPage({ params }: { params: Promise<{ code: string }>
       try {
         // 1. Poll room updates
         const roomRes = await fetchWithAuth(`/api/rooms/${roomCode}`);
+        if (roomRes.status === 404 && !isHost) {
+          setIsRoomTerminated(true);
+          setTerminationMessage("The host has closed this watch party. The room code has been deleted.");
+          webrtcManager.current?.destroy();
+          disconnectSocket();
+          return;
+        }
+
         if (roomRes.ok) {
           const data = await roomRes.json();
           const latestRoom: IRoom = data.room;
@@ -353,6 +423,15 @@ export default function RoomPage({ params }: { params: Promise<{ code: string }>
             handledSignalIds.add(sig.id);
             if (sig.createdAt > lastSignalTime.current) {
               lastSignalTime.current = sig.createdAt;
+            }
+            if (sig.type === "leave" && sig.payload?.roomClosed && !isHost) {
+              setIsRoomTerminated(true);
+              setTerminationMessage(
+                sig.payload?.message || "The host has closed this watch party. The room code has been deleted."
+              );
+              webrtcManager.current?.destroy();
+              disconnectSocket();
+              return;
             }
             handleIncomingSignal(sig, isHost);
           }
@@ -518,10 +597,36 @@ export default function RoomPage({ params }: { params: Promise<{ code: string }>
     });
   };
 
+  const handleConfirmExit = async () => {
+    if (!user || !room) return;
+    setIsClosingRoom(true);
+
+    try {
+      if (isHost) {
+        // Host ends and permanently deletes the room
+        sendSocketCloseRoom(roomCode, "Host closed this watch party.");
+        await fetchWithAuth(`/api/rooms/${roomCode}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "close" }),
+        }).catch(() => {});
+      } else {
+        // Guest leaves the room
+        await fetchWithAuth(`/api/rooms/${roomCode}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "leave" }),
+        }).catch(() => {});
+      }
+    } finally {
+      webrtcManager.current?.destroy();
+      disconnectSocket();
+      router.push("/dashboard");
+    }
+  };
+
   const handleLeaveRoom = () => {
-    webrtcManager.current?.destroy();
-    disconnectSocket();
-    router.push("/dashboard");
+    setShowExitModal(true);
   };
 
   if (loadingRoom || !user) {
@@ -554,7 +659,6 @@ export default function RoomPage({ params }: { params: Promise<{ code: string }>
     );
   }
 
-  const isHost = room.hostUserId === user.id;
   const partnerName = isHost ? room.guestName || "" : room.hostName;
 
   return (
@@ -565,13 +669,13 @@ export default function RoomPage({ params }: { params: Promise<{ code: string }>
         {/* Room Header Info */}
         <div className="flex items-center justify-between pb-4 border-b border-slate-800/80 mb-4">
           <div className="flex items-center space-x-3">
-            <Link
-              href="/dashboard"
+            <button
+              onClick={() => setShowExitModal(true)}
               className="p-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-white transition-colors"
-              title="Leave to Dashboard"
+              title={isHost ? "Close Watch Party" : "Leave Watch Party"}
             >
               <ArrowLeft className="w-4 h-4" />
-            </Link>
+            </button>
             <div>
               <div className="flex items-center space-x-2">
                 <h1 className="text-lg font-bold text-white tracking-tight">
@@ -649,6 +753,117 @@ export default function RoomPage({ params }: { params: Promise<{ code: string }>
         onSendMessage={handleSendMessage}
         currentUserName={user.name}
       />
+
+      {/* Exit Confirmation Modal */}
+      {showExitModal && (
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-4 animate-in fade-in duration-200">
+          <div className="max-w-md w-full rounded-2xl bg-cinema-900 border border-slate-800 p-6 shadow-2xl shadow-black/80 space-y-5">
+            <div className="flex items-start justify-between">
+              <div className="flex items-center space-x-3">
+                <div
+                  className={`p-3 rounded-2xl ${
+                    isHost ? "bg-red-500/10 text-red-400" : "bg-amber-500/10 text-amber-400"
+                  }`}
+                >
+                  {isHost ? <Trash2 className="w-6 h-6" /> : <LogOut className="w-6 h-6" />}
+                </div>
+                <div>
+                  <h3 className="text-lg font-bold text-white">
+                    {isHost ? "Close Watch Party?" : "Leave Watch Party?"}
+                  </h3>
+                  <span className="font-mono text-xs font-bold text-brand-300">
+                    Room #{roomCode}
+                  </span>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowExitModal(false)}
+                className="p-1 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-4 rounded-xl bg-slate-950/60 border border-slate-800/80 text-xs text-slate-300 leading-relaxed space-y-2">
+              {isHost ? (
+                <>
+                  <p className="font-semibold text-red-300 flex items-center space-x-1.5">
+                    <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
+                    <span>Warning: Room code will be permanently deleted</span>
+                  </p>
+                  <p className="text-slate-400">
+                    As the host, leaving will immediately end this watch party. The room code{" "}
+                    <strong className="text-white">#{roomCode}</strong> will be erased from the
+                    server and cannot be used again by you or your partner.
+                  </p>
+                </>
+              ) : (
+                <p className="text-slate-400">
+                  Are you sure you want to leave this watch party? You can rejoin later as long as the
+                  host keeps the room open.
+                </p>
+              )}
+            </div>
+
+            <div className="flex items-center justify-end space-x-3 pt-2">
+              <button
+                type="button"
+                onClick={() => setShowExitModal(false)}
+                disabled={isClosingRoom}
+                className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium transition-colors"
+              >
+                Cancel (Stay in Room)
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmExit}
+                disabled={isClosingRoom}
+                className={`flex items-center space-x-2 px-5 py-2.5 rounded-xl text-xs font-semibold text-white transition-all shadow-lg ${
+                  isHost
+                    ? "bg-red-600 hover:bg-red-500 shadow-red-600/30"
+                    : "bg-amber-600 hover:bg-amber-500 shadow-amber-600/30"
+                }`}
+              >
+                {isClosingRoom ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    <span>{isHost ? "Deleting Room..." : "Leaving..."}</span>
+                  </>
+                ) : (
+                  <>
+                    {isHost ? <Trash2 className="w-4 h-4" /> : <LogOut className="w-4 h-4" />}
+                    <span>{isHost ? "Close & Delete Room" : "Leave Party"}</span>
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Room Terminated by Host Modal (Shown to guest when host closed the room) */}
+      {isRoomTerminated && (
+        <div className="fixed inset-0 z-50 bg-black/85 backdrop-blur-md flex items-center justify-center p-4 animate-in fade-in duration-200">
+          <div className="max-w-md w-full rounded-2xl bg-cinema-900 border border-red-500/30 p-6 shadow-2xl shadow-red-950/40 text-center space-y-4">
+            <div className="w-12 h-12 rounded-2xl bg-red-500/10 border border-red-500/20 text-red-400 mx-auto flex items-center justify-center">
+              <AlertCircle className="w-6 h-6" />
+            </div>
+            <h3 className="text-lg font-bold text-white">Watch Party Ended</h3>
+            <p className="text-xs text-slate-300 leading-relaxed">
+              {terminationMessage ||
+                `The host has ended this watch party. Room code #${roomCode} has expired and can no longer be used.`}
+            </p>
+            <div className="pt-2">
+              <button
+                onClick={() => router.push("/dashboard")}
+                className="w-full py-3 rounded-xl bg-brand-600 hover:bg-brand-500 text-white font-semibold text-xs transition-colors shadow-lg shadow-brand-600/30"
+              >
+                Return to Dashboard
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
